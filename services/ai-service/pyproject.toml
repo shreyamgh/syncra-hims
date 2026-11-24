@@ -1,0 +1,17 @@
+[project]
+name = "syncra-ai-service"
+version = "0.1.0"
+description = "Syncra HIMS AI microservice: Shrutlekhan clinical dictation (STT) and CDSS"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC"]
+ignore = ["S101"] # asserts are fine in tests

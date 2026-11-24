@@ -1,0 +1,14 @@
+# Build context for the Java services is the repository root: keep it small.
+**/target/
+**/node_modules/
+**/dist/
+**/__pycache__/
+**/.pytest_cache/
+.env
+.env.*
+.git/
+database/
+infra/
+frontend/
+services/ai-service/
+services/api-gateway/

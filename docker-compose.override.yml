@@ -1,0 +1,41 @@
+# =============================================================================
+#  Developer overrides — loaded automatically by `docker compose up`.
+#  Publishes datastore and admin ports on 127.0.0.1 ONLY, for psql / IDE /
+#  RabbitMQ console / Orthanc Explorer access from the workstation.
+#
+#  Never ship this file to a hospital server; there, run:
+#    docker compose -f docker-compose.yml up -d
+# =============================================================================
+services:
+  postgres:
+    # Datastores sit on the internal `data` network, where Docker does not
+    # publish ports; joining `app` as well makes the loopback binding work.
+    networks: [data, app]
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+
+  redis:
+    networks: [data, app]
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+
+  rabbitmq:
+    networks: [data, app]
+    ports:
+      - "127.0.0.1:${RABBITMQ_HOST_PORT:-5672}:5672"
+      - "127.0.0.1:${RABBITMQ_MGMT_HOST_PORT:-15672}:15672"
+
+  orthanc:
+    ports:
+      - "127.0.0.1:${ORTHANC_HTTP_HOST_PORT:-8042}:8042"
+
+  iam-service:
+    environment:
+      # The sign-in page also offers pasting a dev token (scripts/dev-token.py).
+      SYNCRA_IAM_DEVELOPMENT_SIGN_IN: "true"
+
+  ai-service:
+    environment:
+      SYNCRA_AI_ENVIRONMENT: development
+    ports:
+      - "127.0.0.1:${AI_SERVICE_HOST_PORT:-8000}:8000"

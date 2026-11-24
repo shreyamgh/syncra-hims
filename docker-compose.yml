@@ -1,0 +1,642 @@
+# =============================================================================
+#  Syncra HIMS — core runtime stack (production baseline)
+#
+#  Services
+#    postgres     PostgreSQL 16  — clinical database + Orthanc index database
+#    redis        Redis 8        — gateway rate limiting, caches, short-lived state
+#    rabbitmq     RabbitMQ 4.3   — domain events (billing, ABDM, audit fan-out)
+#    orthanc      Orthanc PACS   — DICOM store, DICOMweb, Stone Web Viewer
+#    api-gateway  Spring Cloud Gateway (Java 21) — single public HTTP/WS entry point
+#    patient-service / billing-service / abdm-service — Spring Boot 3.2 (Java 21)
+#    ai-service   FastAPI (Python 3.12) — Shrutlekhan dictation STT + CDSS
+#
+#  Networks
+#    app   regular bridge: application services, has egress (ABDM, model pulls)
+#    data  internal bridge: datastores only, NO internet egress
+#
+#  Usage
+#    ./scripts/init-env.sh              # once: creates .env with random secrets
+#    docker compose up -d --build       # dev (auto-loads docker-compose.override.yml)
+#    docker compose -f docker-compose.yml up -d --build   # prod-like, no dev ports
+# =============================================================================
+name: syncra-hims
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  logging: *default-logging
+  security_opt:
+    - no-new-privileges:true
+
+x-timezone: &tz
+  TZ: ${TZ:-Asia/Kolkata}
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16
+  #   First boot only: 00-bootstrap.sh creates extensions, the least-privilege
+  #   application role and the isolated Orthanc database; 10-apply-schema.sh
+  #   executes ./database/init-schema.sql. The preflight entrypoint refuses to
+  #   start on a volume whose initialisation never completed.
+  # ---------------------------------------------------------------------------
+  postgres:
+    <<: *service-defaults
+    image: postgres:16-alpine
+    hostname: postgres
+    entrypoint: ["/syncra/entrypoint-preflight.sh"]
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - wal_compression=on
+      - -c
+      - timezone=${TZ:-Asia/Kolkata}
+      - -c
+      - log_min_duration_statement=500
+      # Never write bound parameter values (patient identifiers, names) to logs.
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_parameter_max_length_on_error=0
+    environment:
+      <<: *tz
+      POSTGRES_DB: ${POSTGRES_DB:-syncra_hims}
+      POSTGRES_USER: ${POSTGRES_USER:-syncra_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (run ./scripts/init-env.sh)}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --data-checksums"
+      SYNCRA_APP_DB_USER: ${SYNCRA_APP_DB_USER:-syncra_app}
+      SYNCRA_APP_DB_PASSWORD: ${SYNCRA_APP_DB_PASSWORD:?SYNCRA_APP_DB_PASSWORD must be set}
+      ORTHANC_DB_PASSWORD: ${ORTHANC_DB_PASSWORD:?ORTHANC_DB_PASSWORD must be set}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/postgres/entrypoint-preflight.sh:/syncra/entrypoint-preflight.sh:ro
+      - ./infra/postgres/initdb:/docker-entrypoint-initdb.d:ro
+      - ./database:/syncra/database:ro
+    networks: [data]
+    shm_size: 256mb
+    stop_grace_period: 60s
+    healthcheck:
+      # TCP probe on purpose: the temporary init server only listens on the unix
+      # socket, so dependants wait until initialisation has fully completed.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  # ---------------------------------------------------------------------------
+  # Redis 8 — password protected, AOF persistence, evicts only keys with a TTL
+  # ---------------------------------------------------------------------------
+  redis:
+    <<: *service-defaults
+    image: redis:8.10-alpine
+    hostname: redis
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 384mb
+      - --maxmemory-policy
+      - volatile-lru
+    environment:
+      <<: *tz
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    volumes:
+      - redisdata:/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # ---------------------------------------------------------------------------
+  # RabbitMQ 4.3 — exchanges/queues are declared by the owning services
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    <<: *service-defaults
+    image: rabbitmq:4.3-management-alpine
+    hostname: rabbitmq # node name rabbit@rabbitmq is bound to the data volume
+    environment:
+      <<: *tz
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-syncra}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-syncra}
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+      - ./infra/rabbitmq/20-syncra.conf:/etc/rabbitmq/conf.d/20-syncra.conf:ro
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  # ---------------------------------------------------------------------------
+  # Orthanc PACS — PostgreSQL index, DICOM files on a dedicated volume/path.
+  #   HTTP (8042) is internal: browsers reach DICOMweb via the gateway at
+  #   /pacs/dicom-web/**. DICOM C-STORE (4242) is published for modalities.
+  # ---------------------------------------------------------------------------
+  orthanc:
+    <<: *service-defaults
+    image: orthancteam/orthanc:26.9.1
+    hostname: orthanc
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *tz
+      VERBOSE_ENABLED: "false"
+      VERBOSE_STARTUP: "false"
+      ORTHANC__NAME: "Syncra PACS"
+      ORTHANC__DICOM_AET: ${ORTHANC_AET:-SYNCRAPACS}
+      ORTHANC__DICOM_PORT: "4242"
+      ORTHANC__REMOTE_ACCESS_ALLOWED: "true"
+      ORTHANC__AUTHENTICATION_ENABLED: "true"
+      ORTHANC__REGISTERED_USERS: '{"${ORTHANC_USERNAME:-syncra_pacs}": "${ORTHANC_PASSWORD:?ORTHANC_PASSWORD must be set}"}'
+      ORTHANC__DEIDENTIFY_LOGS: "true"
+      ORTHANC__STABLE_AGE: "60"
+      ORTHANC__CONCURRENT_JOBS: "2"
+      ORTHANC__STORAGE_COMPRESSION: "false"
+      ORTHANC__OVERWRITE_INSTANCES: "true"
+      # PostgreSQL index (DICOM files themselves stay on the filesystem volume)
+      POSTGRESQL_PLUGIN_ENABLED: "true"
+      ORTHANC__POSTGRESQL__HOST: postgres
+      ORTHANC__POSTGRESQL__PORT: "5432"
+      ORTHANC__POSTGRESQL__DATABASE: orthanc
+      ORTHANC__POSTGRESQL__USERNAME: orthanc
+      ORTHANC__POSTGRESQL__PASSWORD: ${ORTHANC_DB_PASSWORD}
+      ORTHANC__POSTGRESQL__ENABLE_INDEX: "true"
+      ORTHANC__POSTGRESQL__ENABLE_STORAGE: "false"
+      # Plugin default is 50 — too many against max_connections=200 shared with HIMS services.
+      ORTHANC__POSTGRESQL__INDEX_CONNECTIONS_COUNT: "10"
+      # Web viewing / interoperability plugins
+      DICOM_WEB_PLUGIN_ENABLED: "true"
+      STONE_WEB_VIEWER_PLUGIN_ENABLED: "true"
+      # OHIF viewer (/ohif/), reading the studies over DICOMweb; the gateway serves it at /pacs/ohif/.
+      OHIF_PLUGIN_ENABLED: "true"
+      ORTHANC__OHIF__DATA_SOURCE: dicom-web
+      # The browser sees OHIF at /pacs/ohif/ (the gateway strips /pacs): its router must match
+      # that path. Its relative DICOMweb address (../dicom-web) then resolves to /pacs/dicom-web.
+      ORTHANC__OHIF__ROUTER_BASENAME: /pacs/ohif/
+      ORTHANC__DICOM_WEB__ROOT: /dicom-web/
+      ORTHANC__DICOM_WEB__ENABLE_WADO: "true"
+    ports:
+      - "${ORTHANC_DICOM_BIND:-0.0.0.0}:${ORTHANC_DICOM_PORT:-4242}:4242"
+    volumes:
+      # A host path (e.g. /srv/syncra/dicom on the imaging RAID) may be set via
+      # ORTHANC_STORAGE; the default is the named volume below.
+      - ${ORTHANC_STORAGE:-orthanc-storage}:/var/lib/orthanc/db
+    networks: [app, data]
+    healthcheck:
+      # Image-provided probe: reads credentials from the generated config and
+      # calls /changes, which (unlike /system) actually hits the PostgreSQL index.
+      test: ["CMD", "/probes/test-aliveness.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+
+  # ---------------------------------------------------------------------------
+  # API Gateway — JWT validation, Redis rate limiting, circuit breakers,
+  # request-id propagation, WebSocket proxying for dictation.
+  # ---------------------------------------------------------------------------
+  api-gateway:
+    <<: *service-defaults
+    build:
+      context: ./services/api-gateway
+    image: syncra/api-gateway:${SYNCRA_VERSION:-0.1.0}
+    hostname: api-gateway
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *tz
+      SPRING_PROFILES_ACTIVE: ${SYNCRA_ENVIRONMENT:-production}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Duser.timezone=${TZ:-Asia/Kolkata}"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SYNCRA_JWT_SECRET: ${SYNCRA_JWT_SECRET:?SYNCRA_JWT_SECRET must be set}
+      SYNCRA_JWT_ISSUER: ${SYNCRA_JWT_ISSUER:-https://auth.syncra.local}
+      SYNCRA_JWT_AUDIENCE: ${SYNCRA_JWT_AUDIENCE:-syncra-hims}
+      SYNCRA_CORS_ALLOWED_ORIGINS: ${SYNCRA_CORS_ALLOWED_ORIGINS:-http://localhost:4200}
+      SYNCRA_ROUTES_PATIENT_SERVICE_URI: http://patient-service:8081
+      SYNCRA_ROUTES_BILLING_SERVICE_URI: http://billing-service:8082
+      SYNCRA_ROUTES_IAM_SERVICE_URI: http://iam-service:8087
+      SYNCRA_ROUTES_PHARMACY_SERVICE_URI: http://pharmacy-service:8084
+      SYNCRA_ROUTES_ABDM_SERVICE_URI: http://abdm-service:8083
+      SYNCRA_ROUTES_AI_SERVICE_URI: http://ai-service:8000
+      SYNCRA_ROUTES_AI_SERVICE_WS_URI: ws://ai-service:8000
+      ORTHANC_URI: http://orthanc:8042
+      ORTHANC_USERNAME: ${ORTHANC_USERNAME:-syncra_pacs}
+      ORTHANC_PASSWORD: ${ORTHANC_PASSWORD}
+    ports:
+      - "${GATEWAY_BIND:-0.0.0.0}:${GATEWAY_HOST_PORT:-8080}:8080"
+    networks: [app, data]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/actuator/health/readiness || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  # ---------------------------------------------------------------------------
+  # Patient Service — registration/UHID, OPD token queue, IPD beds.
+  # Connects as the least-privilege DML role; re-validates every JWT.
+  # Reached only through the gateway (/api/v1/patients|opd|ipd/**).
+  # ---------------------------------------------------------------------------
+  patient-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/patient-service/Dockerfile
+    image: syncra/patient-service:${SYNCRA_VERSION:-0.1.0}
+    hostname: patient-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *tz
+      SPRING_PROFILES_ACTIVE: ${SYNCRA_ENVIRONMENT:-production}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Duser.timezone=${TZ:-Asia/Kolkata}"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-syncra_hims}
+      SPRING_DATASOURCE_USERNAME: ${SYNCRA_APP_DB_USER:-syncra_app}
+      SPRING_DATASOURCE_PASSWORD: ${SYNCRA_APP_DB_PASSWORD}
+      SYNCRA_JWT_SECRET: ${SYNCRA_JWT_SECRET}
+      SYNCRA_JWT_ISSUER: ${SYNCRA_JWT_ISSUER:-https://auth.syncra.local}
+      SYNCRA_JWT_AUDIENCE: ${SYNCRA_JWT_AUDIENCE:-syncra-hims}
+      # Drug-safety check re-run at signing (AI service CDSS)
+      SYNCRA_CDSS_URL: http://ai-service:8000
+      SYNCRA_CDSS_REQUIRED: ${SYNCRA_CDSS_REQUIRED:-false}
+      # Orthanc, polled to index stable studies against radiology orders
+      SYNCRA_PACS_URL: http://orthanc:8042
+      ORTHANC_USERNAME: ${ORTHANC_USERNAME:-syncra_pacs}
+      ORTHANC_PASSWORD: ${ORTHANC_PASSWORD}
+    networks: [app, data]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9091/actuator/health/readiness || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  # ---------------------------------------------------------------------------
+  # Billing Service — tariffs, OPD slips, IPD interim/final bills, receipts.
+  # Same least-privilege DB role and JWT re-validation as the Patient Service.
+  # ---------------------------------------------------------------------------
+  billing-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/billing-service/Dockerfile
+    image: syncra/billing-service:${SYNCRA_VERSION:-0.1.0}
+    hostname: billing-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *tz
+      SPRING_PROFILES_ACTIVE: ${SYNCRA_ENVIRONMENT:-production}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Duser.timezone=${TZ:-Asia/Kolkata}"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-syncra_hims}
+      SPRING_DATASOURCE_USERNAME: ${SYNCRA_APP_DB_USER:-syncra_app}
+      SPRING_DATASOURCE_PASSWORD: ${SYNCRA_APP_DB_PASSWORD}
+      SYNCRA_JWT_SECRET: ${SYNCRA_JWT_SECRET}
+      SYNCRA_JWT_ISSUER: ${SYNCRA_JWT_ISSUER:-https://auth.syncra.local}
+      SYNCRA_JWT_AUDIENCE: ${SYNCRA_JWT_AUDIENCE:-syncra-hims}
+      # Letterhead printed on bills
+      SYNCRA_HOSPITAL_NAME: ${SYNCRA_HOSPITAL_NAME:-}
+      SYNCRA_HOSPITAL_ADDRESS: ${SYNCRA_HOSPITAL_ADDRESS:-}
+      SYNCRA_HOSPITAL_PHONE: ${SYNCRA_HOSPITAL_PHONE:-}
+      SYNCRA_HOSPITAL_GSTIN: ${SYNCRA_HOSPITAL_GSTIN:-}
+      SYNCRA_BILLING_REGISTRATION_VALIDITY_DAYS: ${SYNCRA_BILLING_REGISTRATION_VALIDITY_DAYS:-365}
+    networks: [app, data]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9092/actuator/health/readiness || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  # ---------------------------------------------------------------------------
+  # IAM Service: staff sign-in (bcrypt passwords, lockout, temporary passwords),
+  # the HS256 access tokens every service verifies, rotating refresh sessions,
+  # and account administration. Reached through the gateway at /api/v1/auth
+  # (no token needed) and /api/v1/iam (administrators).
+  # ---------------------------------------------------------------------------
+  iam-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/iam-service/Dockerfile
+    image: syncra/iam-service:${SYNCRA_VERSION:-0.1.0}
+    hostname: iam-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *tz
+      SPRING_PROFILES_ACTIVE: ${SYNCRA_ENVIRONMENT:-production}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Duser.timezone=${TZ:-Asia/Kolkata}"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-syncra_hims}
+      SPRING_DATASOURCE_USERNAME: ${SYNCRA_APP_DB_USER:-syncra_app}
+      SPRING_DATASOURCE_PASSWORD: ${SYNCRA_APP_DB_PASSWORD}
+      SYNCRA_JWT_SECRET: ${SYNCRA_JWT_SECRET}
+      SYNCRA_JWT_ISSUER: ${SYNCRA_JWT_ISSUER:-https://auth.syncra.local}
+      SYNCRA_JWT_AUDIENCE: ${SYNCRA_JWT_AUDIENCE:-syncra-hims}
+      SYNCRA_IAM_ACCESS_TOKEN_TTL: ${SYNCRA_IAM_ACCESS_TOKEN_TTL:-PT30M}
+      SYNCRA_IAM_SESSION_TTL: ${SYNCRA_IAM_SESSION_TTL:-PT12H}
+      # Refresh cookie is HTTPS-only; browsers treat http://localhost as secure for development.
+      SYNCRA_IAM_COOKIE_SECURE: ${SYNCRA_IAM_COOKIE_SECURE:-true}
+      SYNCRA_IAM_DEVELOPMENT_SIGN_IN: ${SYNCRA_IAM_DEVELOPMENT_SIGN_IN:-false}
+    networks: [app, data]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9097/actuator/health/readiness || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+
+  # ---------------------------------------------------------------------------
+  # Pharmacy Service: stock by batch and expiry (main store, OPD pharmacy),
+  # goods receipts, requisitions, FEFO dispensing, write-offs, Schedule H1
+  # register. Staff reach it at /api/v1/pharmacy through the gateway.
+  # ---------------------------------------------------------------------------
+  pharmacy-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/pharmacy-service/Dockerfile
+    image: syncra/pharmacy-service:${SYNCRA_VERSION:-0.1.0}
+    hostname: pharmacy-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *tz
+      SPRING_PROFILES_ACTIVE: ${SYNCRA_ENVIRONMENT:-production}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Duser.timezone=${TZ:-Asia/Kolkata}"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-syncra_hims}
+      SPRING_DATASOURCE_USERNAME: ${SYNCRA_APP_DB_USER:-syncra_app}
+      SPRING_DATASOURCE_PASSWORD: ${SYNCRA_APP_DB_PASSWORD}
+      SYNCRA_JWT_SECRET: ${SYNCRA_JWT_SECRET}
+      SYNCRA_JWT_ISSUER: ${SYNCRA_JWT_ISSUER:-https://auth.syncra.local}
+      SYNCRA_JWT_AUDIENCE: ${SYNCRA_JWT_AUDIENCE:-syncra-hims}
+      SYNCRA_PHARMACY_NEAR_EXPIRY_DAYS: ${SYNCRA_PHARMACY_NEAR_EXPIRY_DAYS:-90}
+      SYNCRA_PHARMACY_PENDING_DAYS: ${SYNCRA_PHARMACY_PENDING_DAYS:-7}
+    networks: [app, data]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9094/actuator/health/readiness || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 384m
+
+  # ---------------------------------------------------------------------------
+  # ABDM Service — Milestone 1 (ABHA verification, Scan & Share) and Milestone 2
+  # HIP (care-context linking, consents, encrypted FHIR R4 transfer).
+  # Staff reach it at /api/v1/abdm/**; ABDM's gateway calls /api/v3/** (verified
+  # against ABDM's signing keys). Needs egress (app network) to reach ABDM.
+  # Off until SYNCRA_ABDM_ENABLED=true with the hospital's ABDM credentials.
+  # ---------------------------------------------------------------------------
+  abdm-service:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/abdm-service/Dockerfile
+    image: syncra/abdm-service:${SYNCRA_VERSION:-0.1.0}
+    hostname: abdm-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *tz
+      SPRING_PROFILES_ACTIVE: ${SYNCRA_ENVIRONMENT:-production}
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError -Duser.timezone=${TZ:-Asia/Kolkata}"
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-syncra_hims}
+      SPRING_DATASOURCE_USERNAME: ${SYNCRA_APP_DB_USER:-syncra_app}
+      SPRING_DATASOURCE_PASSWORD: ${SYNCRA_APP_DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SYNCRA_JWT_SECRET: ${SYNCRA_JWT_SECRET}
+      SYNCRA_JWT_ISSUER: ${SYNCRA_JWT_ISSUER:-https://auth.syncra.local}
+      SYNCRA_JWT_AUDIENCE: ${SYNCRA_JWT_AUDIENCE:-syncra-hims}
+      SYNCRA_HOSPITAL_NAME: ${SYNCRA_HOSPITAL_NAME:-}
+      SYNCRA_ABDM_ENABLED: ${SYNCRA_ABDM_ENABLED:-false}
+      SYNCRA_ABDM_CM_ID: ${SYNCRA_ABDM_CM_ID:-sbx}
+      SYNCRA_ABDM_HIP_ID: ${SYNCRA_ABDM_HIP_ID:-}
+      SYNCRA_ABDM_CLIENT_ID: ${SYNCRA_ABDM_CLIENT_ID:-}
+      SYNCRA_ABDM_CLIENT_SECRET: ${SYNCRA_ABDM_CLIENT_SECRET:-}
+      SYNCRA_ABDM_GATEWAY_URL: ${SYNCRA_ABDM_GATEWAY_URL:-https://dev.abdm.gov.in/api/hiecm}
+      SYNCRA_ABDM_ABHA_URL: ${SYNCRA_ABDM_ABHA_URL:-https://abhasbx.abdm.gov.in/abha/api}
+      SYNCRA_ABDM_JWKS_URI: ${SYNCRA_ABDM_JWKS_URI:-}
+      SYNCRA_ABDM_TOKEN_ISSUER: ${SYNCRA_ABDM_TOKEN_ISSUER:-}
+      SYNCRA_ABDM_PUSH_SEND_SESSION_TOKEN: ${SYNCRA_ABDM_PUSH_SEND_SESSION_TOKEN:-false}
+      SYNCRA_ABDM_PUBLIC_URL: ${SYNCRA_ABDM_PUBLIC_URL:-}
+      SYNCRA_FHIR_IDENTIFIER_SYSTEM: ${SYNCRA_FHIR_IDENTIFIER_SYSTEM:-https://hims.syncra.local/fhir/identifier}
+      # SMS provider for the OTP of patient-initiated linking (empty = not offered)
+      SYNCRA_SMS_URL: ${SYNCRA_SMS_URL:-}
+      SYNCRA_SMS_AUTH_HEADER: ${SYNCRA_SMS_AUTH_HEADER:-Authorization}
+      SYNCRA_SMS_AUTH_VALUE: ${SYNCRA_SMS_AUTH_VALUE:-}
+      SYNCRA_SMS_SENDER_ID: ${SYNCRA_SMS_SENDER_ID:-}
+      SYNCRA_SMS_TEMPLATE_ID: ${SYNCRA_SMS_TEMPLATE_ID:-}
+    networks: [app, data]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    cap_drop: [ALL]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9093/actuator/health/readiness || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  # ---------------------------------------------------------------------------
+  # AI microservice — WebSocket dictation (Shrutlekhan) and CDSS.
+  # Not published on the host: reachable only through the gateway.
+  # ---------------------------------------------------------------------------
+  ai-service:
+    <<: *service-defaults
+    build:
+      context: ./services/ai-service
+    image: syncra/ai-service:${SYNCRA_VERSION:-0.1.0}
+    hostname: ai-service
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *tz
+      SYNCRA_AI_ENVIRONMENT: ${SYNCRA_ENVIRONMENT:-production}
+      SYNCRA_AI_LOG_LEVEL: ${SYNCRA_AI_LOG_LEVEL:-INFO}
+      SYNCRA_AI_REDIS_HOST: redis
+      SYNCRA_AI_REDIS_PORT: "6379"
+      SYNCRA_AI_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SYNCRA_AI_REDIS_DB: "1"
+      SYNCRA_AI_MODEL_DIR: /models
+      # On-premises Whisper; the model downloads once into the ai-models volume.
+      # For air-gapped hospitals, pre-copy the model and set a local path instead.
+      SYNCRA_AI_STT_ENGINE: ${SYNCRA_AI_STT_ENGINE:-whisper}
+      SYNCRA_AI_WHISPER_MODEL: ${SYNCRA_AI_WHISPER_MODEL:-small}
+      SYNCRA_AI_WHISPER_CPU_THREADS: ${SYNCRA_AI_WHISPER_CPU_THREADS:-4}
+      # CDSS rules: the bundled starter set unless a hospital-reviewed file is mounted here
+      SYNCRA_AI_CDSS_KNOWLEDGE_PATH: ${SYNCRA_AI_CDSS_KNOWLEDGE_PATH:-}
+    volumes:
+      - ai-models:/models
+    networks: [app, data]
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop: [ALL]
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+
+  # ---------------------------------------------------------------------------
+  # Doctor Desk — React SPA on unprivileged nginx; proxies /api and /ws to the
+  # gateway so the browser uses one origin. Microphone access requires HTTPS in
+  # production (terminate TLS here or in front of it).
+  # ---------------------------------------------------------------------------
+  doctor-desk:
+    <<: *service-defaults
+    build:
+      context: ./frontend/doctor-desk
+    image: syncra/doctor-desk:${SYNCRA_VERSION:-0.1.0}
+    hostname: doctor-desk
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    environment:
+      <<: *tz
+    ports:
+      - "${WEB_BIND:-0.0.0.0}:${WEB_HOST_PORT:-3000}:8080"
+    networks: [app]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          memory: 128m
+
+networks:
+  app:
+    name: syncra-app
+    driver: bridge
+  data:
+    name: syncra-data
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:
+  redisdata:
+  rabbitmqdata:
+  orthanc-storage:
+  ai-models:

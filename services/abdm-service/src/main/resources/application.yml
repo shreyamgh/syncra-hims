@@ -1,0 +1,121 @@
+# =============================================================================
+#  Syncra HIMS — ABDM Service
+#    Milestone 1: ABHA verification, Scan & Share
+#    Milestone 2: HIP — care-context linking, consents, FHIR R4 data transfer
+# =============================================================================
+server:
+  port: 8083
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+
+spring:
+  application:
+    name: abdm-service
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/syncra_hims}
+    username: ${SPRING_DATASOURCE_USERNAME:syncra_app}
+    password: ${SPRING_DATASOURCE_PASSWORD:}
+    hikari:
+      pool-name: abdm-service
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 5000
+      data-source-properties:
+        ApplicationName: abdm-service
+        # Keep PHI out of exception messages and logs (see patient-service).
+        logServerErrorDetail: false
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: 2
+      timeout: 2s
+      connect-timeout: 2s
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+
+management:
+  server:
+    port: 9093 # internal only
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+      group:
+        readiness:
+          include: readinessState,db
+  health:
+    # Only linking depends on Redis; an outage must not take ABDM callbacks offline.
+    redis:
+      enabled: false
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+syncra:
+  security:
+    jwt:
+      secret: ${SYNCRA_JWT_SECRET:}
+      issuer: ${SYNCRA_JWT_ISSUER:https://auth.syncra.local}
+      audience: ${SYNCRA_JWT_AUDIENCE:syncra-hims}
+  hospital:
+    time-zone: Asia/Kolkata
+  abdm:
+    enabled: ${SYNCRA_ABDM_ENABLED:false}
+    # sbx = sandbox consent manager; abdm = production
+    cm-id: ${SYNCRA_ABDM_CM_ID:sbx}
+    # Health Facility Registry id of this hospital (it is the HIP id)
+    hip-id: ${SYNCRA_ABDM_HIP_ID:}
+    hip-name: ${SYNCRA_HOSPITAL_NAME:}
+    gateway:
+      base-url: ${SYNCRA_ABDM_GATEWAY_URL:https://dev.abdm.gov.in/api/hiecm}
+      client-id: ${SYNCRA_ABDM_CLIENT_ID:}
+      client-secret: ${SYNCRA_ABDM_CLIENT_SECRET:}
+    abha:
+      base-url: ${SYNCRA_ABDM_ABHA_URL:https://abhasbx.abdm.gov.in/abha/api}
+    callbacks:
+      # Defaults to <gateway base-url>/gateway/v3/certs
+      jwks-uri: ${SYNCRA_ABDM_JWKS_URI:}
+      issuer: ${SYNCRA_ABDM_TOKEN_ISSUER:}
+    data-push:
+      require-https: ${SYNCRA_ABDM_PUSH_REQUIRE_HTTPS:true}
+      send-session-token: ${SYNCRA_ABDM_PUSH_SEND_SESSION_TOKEN:false}
+    otp:
+      # The hospital's SMS provider (DLT-registered sender and template). Empty = patient-initiated
+      # linking answers that OTP delivery is not configured.
+      sms-url: ${SYNCRA_SMS_URL:}
+      sms-auth-header: ${SYNCRA_SMS_AUTH_HEADER:Authorization}
+      sms-auth-value: ${SYNCRA_SMS_AUTH_VALUE:}
+      sms-sender-id: ${SYNCRA_SMS_SENDER_ID:}
+      sms-template-id: ${SYNCRA_SMS_TEMPLATE_ID:}
+    hiu:
+      # Public HTTPS URL of this ABDM bridge: other hospitals push consented records to
+      # <public-url>/hiu/v3/data/push/<token>. Empty = this hospital does not request records.
+      public-url: ${SYNCRA_ABDM_PUBLIC_URL:}
+      max-retention-days: ${SYNCRA_ABDM_HIU_MAX_RETENTION_DAYS:30}
+    fhir:
+      identifier-system: ${SYNCRA_FHIR_IDENTIFIER_SYSTEM:https://hims.syncra.local/fhir/identifier}
+      hospital-name: ${SYNCRA_HOSPITAL_NAME:}
+
+logging:
+  pattern:
+    level: "%5p [%X{requestId:-}]"
+  level:
+    root: INFO
+    # HAPI logs resource content at DEBUG; never let PHI reach the logs.
+    ca.uhn.fhir: WARN

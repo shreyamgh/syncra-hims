@@ -1,0 +1,80 @@
+# =============================================================================
+#  Syncra HIMS — IAM Service (staff sign-in, tokens, account administration)
+# =============================================================================
+server:
+  port: 8087
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+
+spring:
+  application:
+    name: iam-service
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/syncra_hims}
+    username: ${SPRING_DATASOURCE_USERNAME:syncra_app}
+    password: ${SPRING_DATASOURCE_PASSWORD:}
+    hikari:
+      pool-name: iam-service
+      maximum-pool-size: 6
+      minimum-idle: 1
+      connection-timeout: 5000
+      data-source-properties:
+        ApplicationName: iam-service
+        logServerErrorDetail: false
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+
+management:
+  server:
+    port: 9097 # internal only
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+      group:
+        readiness:
+          include: readinessState,db
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+syncra:
+  security:
+    jwt:
+      # The IAM service signs with the same secret every service verifies with.
+      secret: ${SYNCRA_JWT_SECRET:}
+      issuer: ${SYNCRA_JWT_ISSUER:https://auth.syncra.local}
+      audience: ${SYNCRA_JWT_AUDIENCE:syncra-hims}
+  hospital:
+    time-zone: Asia/Kolkata
+  iam:
+    # Short-lived access token; the desk renews it with the refresh cookie while the shift lasts.
+    access-token-ttl: ${SYNCRA_IAM_ACCESS_TOKEN_TTL:PT30M}
+    # Longest a sign-in lasts (refreshes do not extend it): a shift.
+    session-ttl: ${SYNCRA_IAM_SESSION_TTL:PT12H}
+    max-failed-attempts: ${SYNCRA_IAM_MAX_FAILED_ATTEMPTS:5}
+    lockout: ${SYNCRA_IAM_LOCKOUT:PT15M}
+    # The refresh cookie is Secure (HTTPS only; browsers treat localhost as secure).
+    cookie-secure: ${SYNCRA_IAM_COOKIE_SECURE:true}
+    # Development only: lets the sign-in page offer pasting a dev token.
+    development-sign-in: ${SYNCRA_IAM_DEVELOPMENT_SIGN_IN:false}
+
+logging:
+  pattern:
+    level: "%5p [%X{requestId:-}]"
+  level:
+    root: INFO

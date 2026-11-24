@@ -1,0 +1,233 @@
+# =============================================================================
+#  Syncra HIMS — API Gateway
+#  Every value that differs between environments is an env-var placeholder;
+#  docker-compose.yml supplies them. Secrets have NO defaults (fail fast).
+# =============================================================================
+server:
+  port: 8080
+  shutdown: graceful
+  max-http-request-header-size: 16KB # JWTs with many roles/claims
+  # NOTE: do not enable reactor-netty access logging — WebSocket URLs carry the
+  # access_token query parameter until the gateway strips it.
+
+spring:
+  application:
+    name: api-gateway
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
+  main:
+    web-application-type: reactive
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: 0
+      timeout: 2s
+      connect-timeout: 2s
+
+  cloud:
+    gateway:
+      httpclient:
+        connect-timeout: 3000
+        response-timeout: 30s
+        pool:
+          max-idle-time: 30s
+        websocket:
+          max-frame-payload-length: 262144 # 256 KiB audio frames
+
+      default-filters:
+        # Spring Security already adds CORS headers; drop duplicates from upstreams.
+        - DedupeResponseHeader=Access-Control-Allow-Origin Access-Control-Allow-Credentials, RETAIN_FIRST
+        # Per-user token bucket in Redis. Fails open if Redis is unreachable.
+        - name: RequestRateLimiter
+          args:
+            key-resolver: "#{@principalOrIpKeyResolver}"
+            redis-rate-limiter.replenishRate: 25
+            redis-rate-limiter.burstCapacity: 50
+            redis-rate-limiter.requestedTokens: 1
+
+      routes:
+        # --- Patient Service (registration/UHID, OPD queue, IPD beds, EMR)
+        - id: patient-service
+          uri: ${SYNCRA_ROUTES_PATIENT_SERVICE_URI:http://localhost:8081}
+          predicates:
+            - Path=/api/v1/patients/**,/api/v1/opd/**,/api/v1/ipd/**,/api/v1/emr/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: patientService
+                fallbackUri: forward:/fallback/patient-service
+
+        # --- Billing Service (tariffs, OPD slips, IPD bills, receipts)
+        - id: billing-service
+          uri: ${SYNCRA_ROUTES_BILLING_SERVICE_URI:http://localhost:8082}
+          predicates:
+            - Path=/api/v1/billing/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: billingService
+                fallbackUri: forward:/fallback/billing-service
+
+        # --- IAM Service: sign-in (no token needed) and account administration
+        - id: iam-service
+          uri: ${SYNCRA_ROUTES_IAM_SERVICE_URI:http://localhost:8087}
+          predicates:
+            - Path=/api/v1/auth/**,/api/v1/iam/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: iamService
+                fallbackUri: forward:/fallback/iam-service
+
+        # --- Pharmacy Service (stock, receipts, requisitions, dispensing, registers)
+        - id: pharmacy-service
+          uri: ${SYNCRA_ROUTES_PHARMACY_SERVICE_URI:http://localhost:8084}
+          predicates:
+            - Path=/api/v1/pharmacy/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: pharmacyService
+                fallbackUri: forward:/fallback/pharmacy-service
+
+        # --- ABDM Service, staff API (ABHA verification, Scan & Share desk, care contexts, consents)
+        - id: abdm-service
+          uri: ${SYNCRA_ROUTES_ABDM_SERVICE_URI:http://localhost:8083}
+          predicates:
+            - Path=/api/v1/abdm/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: abdmService
+                fallbackUri: forward:/fallback/abdm-service
+
+        # --- ABDM gateway -> HIP callbacks (server to server). The gateway does not check a
+        #     Syncra JWT here; the ABDM Service verifies ABDM's own signed token on every call.
+        - id: abdm-callbacks
+          uri: ${SYNCRA_ROUTES_ABDM_SERVICE_URI:http://localhost:8083}
+          predicates:
+            - Path=/api/v3/**
+            - Method=POST
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: abdmService
+                fallbackUri: forward:/fallback/abdm-service
+
+        # --- Other hospitals (HIPs) pushing records this hospital asked for under consent (HIU).
+        #     No Syncra JWT: the URL carries a one-time secret, and the ABDM Service only accepts
+        #     data encrypted for the key of the matching request.
+        - id: abdm-data-push
+          uri: ${SYNCRA_ROUTES_ABDM_SERVICE_URI:http://localhost:8083}
+          predicates:
+            - Path=/hiu/v3/data/push/**
+            - Method=POST
+          filters:
+            - name: RequestSize
+              args:
+                maxSize: 10MB
+            - name: CircuitBreaker
+              args:
+                name: abdmService
+                fallbackUri: forward:/fallback/abdm-service
+
+        # --- AI service REST (CDSS, dictation post-processing)
+        - id: ai-service
+          uri: ${SYNCRA_ROUTES_AI_SERVICE_URI:http://localhost:8000}
+          predicates:
+            - Path=/api/v1/ai/**
+          filters:
+            - name: CircuitBreaker
+              args:
+                name: aiService
+                fallbackUri: forward:/fallback/ai-service
+
+        # --- AI service WebSocket (Shrutlekhan streaming dictation)
+        - id: ai-dictation-ws
+          uri: ${SYNCRA_ROUTES_AI_SERVICE_WS_URI:ws://localhost:8000}
+          predicates:
+            - Path=/ws/ai/**
+          filters:
+            - RemoveRequestParameter=access_token
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 50
+        minimum-number-of-calls: 20
+        failure-rate-threshold: 50
+        slow-call-duration-threshold: 10s
+        slow-call-rate-threshold: 80
+        wait-duration-in-open-state: 15s
+        permitted-number-of-calls-in-half-open-state: 5
+        automatic-transition-from-open-to-half-open-enabled: true
+    instances:
+      patientService:
+        base-config: default
+      billingService:
+        base-config: default
+      aiService:
+        base-config: default
+      abdmService:
+        base-config: default
+  timelimiter:
+    # Spring Cloud CircuitBreaker defaults to a 1 s time limit, which would
+    # abort legitimate report/billing queries. Align with the HTTP timeout.
+    configs:
+      default:
+        timeout-duration: 30s
+    instances:
+      patientService:
+        base-config: default
+      billingService:
+        base-config: default
+      aiService:
+        base-config: default
+      abdmService:
+        base-config: default
+
+management:
+  server:
+    port: 9090 # internal only — not published by docker-compose
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+  health:
+    # Rate limiting fails open, so a Redis outage must not take the gateway out
+    # of rotation.
+    redis:
+      enabled: false
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+syncra:
+  gateway:
+    jwt:
+      secret: ${SYNCRA_JWT_SECRET:}
+      issuer: ${SYNCRA_JWT_ISSUER:https://auth.syncra.local}
+      audience: ${SYNCRA_JWT_AUDIENCE:syncra-hims}
+    cors:
+      allowed-origins: ${SYNCRA_CORS_ALLOWED_ORIGINS:http://localhost:4200}
+    pacs-cookie-secure: ${SYNCRA_PACS_COOKIE_SECURE:true}
+    orthanc:
+      uri: ${ORTHANC_URI:http://localhost:8042}
+      username: ${ORTHANC_USERNAME:}
+      password: ${ORTHANC_PASSWORD:}
+
+logging:
+  level:
+    root: INFO
+    org.springframework.cloud.gateway: INFO
+    io.github.resilience4j: WARN

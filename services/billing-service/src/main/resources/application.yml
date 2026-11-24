@@ -1,0 +1,78 @@
+# =============================================================================
+#  Syncra HIMS — Billing Service (tariffs, OPD slips, IPD bills, receipts)
+# =============================================================================
+server:
+  port: 8082
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+
+spring:
+  application:
+    name: billing-service
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/syncra_hims}
+    username: ${SPRING_DATASOURCE_USERNAME:syncra_app}
+    password: ${SPRING_DATASOURCE_PASSWORD:}
+    hikari:
+      pool-name: billing-service
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 5000
+      data-source-properties:
+        ApplicationName: billing-service
+        # Keep PHI out of exception messages and logs (see patient-service).
+        logServerErrorDetail: false
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+
+management:
+  server:
+    port: 9092 # internal only
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+      group:
+        readiness:
+          include: readinessState,db
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+syncra:
+  security:
+    jwt:
+      secret: ${SYNCRA_JWT_SECRET:}
+      issuer: ${SYNCRA_JWT_ISSUER:https://auth.syncra.local}
+      audience: ${SYNCRA_JWT_AUDIENCE:syncra-hims}
+  hospital:
+    time-zone: Asia/Kolkata
+  billing:
+    # A registration fee covers further OPD visits for this many days.
+    registration-validity-days: ${SYNCRA_BILLING_REGISTRATION_VALIDITY_DAYS:365}
+    # Printed on bills; set per hospital.
+    hospital:
+      name: ${SYNCRA_HOSPITAL_NAME:}
+      address: ${SYNCRA_HOSPITAL_ADDRESS:}
+      phone: ${SYNCRA_HOSPITAL_PHONE:}
+      gstin: ${SYNCRA_HOSPITAL_GSTIN:}
+
+logging:
+  pattern:
+    level: "%5p [%X{requestId:-}]"
+  level:
+    root: INFO

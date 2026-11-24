@@ -1,0 +1,104 @@
+# =============================================================================
+#  Syncra HIMS — Patient Service (registration/UHID, OPD queue, IPD beds)
+#  Environment-specific values are env-var placeholders; secrets have no defaults.
+# =============================================================================
+server:
+  port: 8081
+  shutdown: graceful
+  error:
+    include-message: never
+    include-stacktrace: never
+
+spring:
+  application:
+    name: patient-service
+  lifecycle:
+    timeout-per-shutdown-phase: 25s
+  threads:
+    virtual:
+      enabled: true
+
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/syncra_hims}
+    # Least-privilege DML role created by infra/postgres/initdb/00-bootstrap.sh
+    username: ${SPRING_DATASOURCE_USERNAME:syncra_app}
+    password: ${SPRING_DATASOURCE_PASSWORD:}
+    hikari:
+      pool-name: patient-service
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 5000
+      data-source-properties:
+        ApplicationName: patient-service
+        # Keep PHI out of exception messages and logs: without this, pgjdbc inlines
+        # the server DETAIL ("Key (abha_number)=(...)") and batch parameter values.
+        logServerErrorDetail: false
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      # The schema is owned by database/init-schema.sql (+ migrations), never by Hibernate.
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+          batch_size: 20
+        order_inserts: true
+        order_updates: true
+
+  jackson:
+    default-property-inclusion: non_null
+    serialization:
+      write-dates-as-timestamps: false
+
+management:
+  server:
+    port: 9091 # internal only — not published by docker-compose
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+      group:
+        readiness:
+          include: readinessState,db
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+syncra:
+  security:
+    jwt:
+      secret: ${SYNCRA_JWT_SECRET:}
+      issuer: ${SYNCRA_JWT_ISSUER:https://auth.syncra.local}
+      audience: ${SYNCRA_JWT_AUDIENCE:syncra-hims}
+  hospital:
+    time-zone: Asia/Kolkata
+  # Drug-safety check re-run when a prescription is signed (AI service CDSS).
+  cdss:
+    url: ${SYNCRA_CDSS_URL:}
+    timeout: 3s
+    # true = refuse to sign prescriptions while the CDSS is unreachable
+    required: ${SYNCRA_CDSS_REQUIRED:false}
+  # Orthanc PACS, polled to index stable studies against radiology orders.
+  pacs:
+    url: ${SYNCRA_PACS_URL:}
+    username: ${ORTHANC_USERNAME:}
+    password: ${ORTHANC_PASSWORD:}
+    poll-interval: PT30S
+
+logging:
+  pattern:
+    level: "%5p [%X{requestId:-}]"
+  level:
+    root: INFO
+    org.hibernate.SQL: WARN
+    # Constraint/trigger failures are expected business outcomes, translated to
+    # 409/422 by ApiExceptionHandler (which logs anything unexpected itself).
+    org.hibernate.engine.jdbc.spi.SqlExceptionHelper: "OFF"
+    org.hibernate.orm.jdbc.batch: "OFF"

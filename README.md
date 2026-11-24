@@ -87,6 +87,9 @@ docker compose -f docker-compose.yml up -d --build
 | redis | `redis:8.10-alpine` | none | `127.0.0.1:6379` |
 | rabbitmq | `rabbitmq:4.3-management-alpine` | none | `127.0.0.1:5672`, UI `:15672` |
 
+Class diagrams of the domain model (every area, from the schema) and of the main service
+classes are in [`docs/class-diagram.md`](docs/class-diagram.md).
+
 ## Database schema (Step 2)
 
 `database/init-schema.sql` defines 42 tables and 4 views in 11 schemas, one per
